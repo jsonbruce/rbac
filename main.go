@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/jsonbruce/rbac/model"
+	"github.com/jsonbruce/rbac/token"
 	"github.com/jsonbruce/rbac/utils"
 )
 
@@ -99,6 +102,8 @@ func initData() {
 }
 
 func initServer() {
+	tokener := token.NewTokener()
+
 	rbacModel := &model.RBACModel{
 		Users:           users,
 		Roles:           roles,
@@ -128,9 +133,9 @@ func initServer() {
 		})
 	}
 
-	auther := func(next http.Handler) http.Handler {
+	authentication := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			log.Println("@auther start")
+			log.Println("@authentication start")
 
 			// Skip signin
 			if r.Method == http.MethodPost && r.URL.Path == "/signin" {
@@ -140,17 +145,53 @@ func initServer() {
 
 			// Authentication
 			// Check r.Header.Get("Authorization")
-			uid := r.Header.Get("Authorization")
-
-			_, err := rbacModel.FindUserByUUID(uid)
-			if err != nil {
+			authHeader := strings.Split(r.Header.Get("Authorization"), "Bearer ")
+			if len(authHeader) != 2 {
 				utils.WriteResponse(w, utils.Response{
 					Code:    403,
-					Message: "Authentication Error. Account not exist or token expired",
+					Message: "Authentication Error. Malformed Token",
 					Data:    nil,
 				})
 				return
 			}
+
+			uid, err := tokener.Verify(authHeader[1])
+			if err != nil {
+				utils.WriteResponse(w, utils.Response{
+					Code:    403,
+					Message: fmt.Sprintf("Authentication Error. %s", err.Error()),
+					Data:    nil,
+				})
+				return
+			}
+
+			_, err = rbacModel.FindUserByUUID(uid)
+			if err != nil {
+				utils.WriteResponse(w, utils.Response{
+					Code:    403,
+					Message: "Authentication Error. Account not exist",
+					Data:    nil,
+				})
+				return
+			}
+
+			// Access context values in handlers use r.Context().Value("uid")
+			ctx := context.WithValue(r.Context(), "uid", uid)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+
+	authorization := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Println("@authorization start")
+
+			// Skip signin
+			if r.Method == http.MethodPost && r.URL.Path == "/signin" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			uid := r.Context().Value("uid").(string)
 
 			// Authorization
 			// Permission is action on resource
@@ -204,11 +245,11 @@ func initServer() {
 			return
 		}
 
-		ur, err := rbacModel.GetUserRoleByUUID(user.UUID)
+		userToken, err := tokener.Sign(user.UUID)
 		if err != nil {
 			utils.WriteResponse(w, utils.Response{
-				Code:    403,
-				Message: fmt.Sprintf("find user: ", err.Error()),
+				Code:    50001,
+				Message: err.Error(),
 				Data:    nil,
 			})
 			return
@@ -217,10 +258,7 @@ func initServer() {
 		utils.WriteResponse(w, utils.Response{
 			Code:    0,
 			Message: "",
-			Data: map[string]string{
-				"uuid": user.UUID,
-				"role": ur,
-			},
+			Data:    userToken,
 		})
 	})
 	serverMux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
@@ -239,19 +277,7 @@ func initServer() {
 	})
 
 	server := &http.Server{
-		Addr:              "",
-		Handler:           logger(timer(auther(serverMux))),
-		TLSConfig:         nil,
-		ReadTimeout:       0,
-		ReadHeaderTimeout: 0,
-		WriteTimeout:      0,
-		IdleTimeout:       0,
-		MaxHeaderBytes:    0,
-		TLSNextProto:      nil,
-		ConnState:         nil,
-		ErrorLog:          nil,
-		BaseContext:       nil,
-		ConnContext:       nil,
+		Handler: logger(timer(authentication(authorization(serverMux)))),
 	}
 
 	log.Fatal(server.ListenAndServe())
